@@ -76,6 +76,14 @@ logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "DeepseekV2Config"
 
+def r_str(s):
+    return "\033[91m" + str(s) + "\033[0m"
+def g_str(s):
+    return "\033[92m" + str(s) + "\033[0m"
+def y_str(s):
+    return "\033[93m" + str(s) + "\033[0m"
+def b_str(s):
+    return "\033[94m" + str(s) + "\033[0m"
 
 def _get_unpad_data(attention_mask):
     seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
@@ -372,9 +380,11 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
 
 
 class DeepseekV2MLP(nn.Module):
-    def __init__(self, config, hidden_size=None, intermediate_size=None):
+    def __init__(self, config, layer_idx, name=None, hidden_size=None, intermediate_size=None):
         super().__init__()
         self.config = config
+        self.layer_idx = layer_idx
+        self.name = name
         self.hidden_size = config.hidden_size if hidden_size is None else hidden_size
         self.intermediate_size = (
             config.intermediate_size if intermediate_size is None else intermediate_size
@@ -386,6 +396,9 @@ class DeepseekV2MLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
+        name = self.name if self.name else "MLP"
+        print(y_str(f"\tRunning ") + f"{name} " 
+              + y_str(f"for layer ") + f"{self.layer_idx}")
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
 
@@ -523,10 +536,11 @@ class DeepseekV2MoE(nn.Module):
     A mixed expert module containing shared experts.
     """
 
-    def __init__(self, config):
+    def __init__(self, config, layer_idx):
         super().__init__()
         self.config = config
         self.num_experts_per_tok = config.num_experts_per_tok
+        self.layer_idx = layer_idx
 
         if hasattr(config, "ep_size") and config.ep_size > 1:
             assert config.ep_size == dist.get_world_size()
@@ -537,7 +551,8 @@ class DeepseekV2MoE(nn.Module):
                 [
                     (
                         DeepseekV2MLP(
-                            config, intermediate_size=config.moe_intermediate_size
+                            config, intermediate_size=config.moe_intermediate_size,
+                            layer_idx=layer_idx, name=f"expert_{i}"
                         )
                         if i >= self.ep_rank * self.experts_per_rank
                         and i < (self.ep_rank + 1) * self.experts_per_rank
@@ -553,7 +568,8 @@ class DeepseekV2MoE(nn.Module):
             self.experts = nn.ModuleList(
                 [
                     DeepseekV2MLP(
-                        config, intermediate_size=config.moe_intermediate_size
+                        config, intermediate_size=config.moe_intermediate_size,
+                        layer_idx=layer_idx, name=f"expert_{i}"
                     )
                     for i in range(config.n_routed_experts)
                 ]
@@ -562,7 +578,8 @@ class DeepseekV2MoE(nn.Module):
         if config.n_shared_experts is not None:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             self.shared_experts = DeepseekV2MLP(
-                config=config, intermediate_size=intermediate_size
+                config=config, intermediate_size=intermediate_size,
+                layer_idx=layer_idx, name="shared_experts"
             )
 
     def forward(self, hidden_states):
@@ -570,19 +587,7 @@ class DeepseekV2MoE(nn.Module):
         orig_shape = hidden_states.shape
         topk_idx, topk_weight, aux_loss = self.gate(hidden_states)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-        flat_topk_idx = topk_idx.view(-1)
-        if self.training:
-            hidden_states = hidden_states.repeat_interleave(
-                self.num_experts_per_tok, dim=0
-            )
-            y = torch.empty_like(hidden_states)
-            for i, expert in enumerate(self.experts):
-                y[flat_topk_idx == i] = expert(hidden_states[flat_topk_idx == i])
-            y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
-            y = y.to(hidden_states.dtype).view(*orig_shape)
-            y = AddAuxiliaryLoss.apply(y, aux_loss)
-        else:
-            y = self.moe_infer(hidden_states, topk_idx, topk_weight).view(*orig_shape)
+        y = self.moe_infer(hidden_states, topk_idx, topk_weight).view(*orig_shape)
         if self.config.n_shared_experts is not None:
             y = y + self.shared_experts(identity)
         return y
@@ -1199,19 +1204,19 @@ class DeepseekV2DecoderLayer(nn.Module):
     def __init__(self, config: DeepseekV2Config, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-
+        self.layer_idx = layer_idx
         self.self_attn = ATTENTION_CLASSES[config._attn_implementation](
             config=config, layer_idx=layer_idx
         )
 
         self.mlp = (
-            DeepseekV2MoE(config)
+            DeepseekV2MoE(config, layer_idx=layer_idx)
             if (
                 config.n_routed_experts is not None
                 and layer_idx >= config.first_k_dense_replace
                 and layer_idx % config.moe_layer_freq == 0
             )
-            else DeepseekV2MLP(config)
+            else DeepseekV2MLP(config, layer_idx=layer_idx)
         )
         self.input_layernorm = DeepseekV2RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -1254,6 +1259,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         hidden_states = self.input_layernorm(hidden_states)
 
+        print(b_str(f"Running layer {self.layer_idx}"))
         # Self Attention
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
@@ -1593,8 +1599,10 @@ class DeepseekV2ForCausalLM(DeepseekV2PreTrainedModel):
         self.model = DeepseekV2Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
+        self.runs = 0
         # Initialize weights and apply final processing
+        print(g_str("Initializing CS262 DeepSeek V2 Model"))
+        
         self.post_init()
 
     def get_input_embeddings(self):
@@ -1670,6 +1678,8 @@ class DeepseekV2ForCausalLM(DeepseekV2PreTrainedModel):
         return_dict = (
             return_dict if return_dict is not None else self.config.use_return_dict
         )
+        print(g_str("Running run ") + str(self.runs))
+        self.runs += 1
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
@@ -1725,7 +1735,7 @@ class DeepseekV2ForCausalLM(DeepseekV2PreTrainedModel):
             if isinstance(past_key_values, Cache):
                 cache_length = past_key_values.get_seq_length()
                 past_length = past_key_values.seen_tokens
-                max_cache_length = past_key_values.get_max_length()
+                max_cache_length = past_key_values.get_max_cache_shape()
             else:
                 cache_length = past_length = past_key_values[0][0].shape[2]
                 max_cache_length = None
