@@ -44,7 +44,7 @@ tokenizer = AutoTokenizer.from_pretrained("./DeepSeek-V2-Lite",
 model = AutoModelForCausalLM.from_pretrained(
     "./DeepSeek-V2-Lite",
     trust_remote_code=True,
-    torch_dtype=torch.bfloat16  # Use torch.float16 if bfloat16 is not supported
+    torch_dtype=torch.bfloat16 
 ).cuda()
 
 # Prepare input
@@ -52,5 +52,5 @@ input_text = "Explain the concept of mixture-of-experts in machine learning."
 inputs = tokenizer(input_text, return_tensors="pt").to(model.device)
 
 # Generate output
-outputs = model.generate(**inputs, max_new_tokens=10, do_sample=False,)
+outputs = model.generate(**inputs, max_new_tokens=30, do_sample=False,)
 print(tokenizer.decode(outputs[0], skip_special_tokens=True))

@@ -541,39 +541,18 @@ class DeepseekV2MoE(nn.Module):
         self.config = config
         self.num_experts_per_tok = config.num_experts_per_tok
         self.layer_idx = layer_idx
-
-        if hasattr(config, "ep_size") and config.ep_size > 1:
-            assert config.ep_size == dist.get_world_size()
-            self.ep_size = config.ep_size
-            self.experts_per_rank = config.n_routed_experts // config.ep_size
-            self.ep_rank = dist.get_rank()
-            self.experts = nn.ModuleList(
-                [
-                    (
-                        DeepseekV2MLP(
-                            config, intermediate_size=config.moe_intermediate_size,
-                            layer_idx=layer_idx, name=f"expert_{i}"
-                        )
-                        if i >= self.ep_rank * self.experts_per_rank
-                        and i < (self.ep_rank + 1) * self.experts_per_rank
-                        else None
-                    )
-                    for i in range(config.n_routed_experts)
-                ]
-            )
-        else:
-            self.ep_size = 1
-            self.experts_per_rank = config.n_routed_experts
-            self.ep_rank = 0
-            self.experts = nn.ModuleList(
-                [
-                    DeepseekV2MLP(
-                        config, intermediate_size=config.moe_intermediate_size,
-                        layer_idx=layer_idx, name=f"expert_{i}"
-                    )
-                    for i in range(config.n_routed_experts)
-                ]
-            )
+        self.ep_size = 1
+        self.experts_per_rank = config.n_routed_experts
+        self.ep_rank = 0
+        self.experts = nn.ModuleList(
+            [
+                DeepseekV2MLP(
+                    config, intermediate_size=config.moe_intermediate_size,
+                    layer_idx=layer_idx, name=f"expert_{i}"
+                )
+                for i in range(config.n_routed_experts)
+            ]
+        )
         self.gate = MoEGate(config)
         if config.n_shared_experts is not None:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
@@ -600,38 +579,6 @@ class DeepseekV2MoE(nn.Module):
         idxs = topk_ids.view(-1).argsort()
         sorted_tokens = x[idxs // topk_ids.shape[1]]
         sorted_tokens_shape = sorted_tokens.shape
-        if self.ep_size > 1:
-            tokens_per_ep_rank = tokens_per_expert.view(self.ep_size, -1).sum(dim=1)
-            tokens_per_expert_group = tokens_per_expert.new_empty(
-                tokens_per_expert.shape[0]
-            )
-            dist.all_to_all_single(tokens_per_expert_group, tokens_per_expert)
-            output_splits = (
-                tokens_per_expert_group.view(self.ep_size, -1)
-                .sum(1)
-                .cpu()
-                .numpy()
-                .tolist()
-            )
-            gathered_tokens = sorted_tokens.new_empty(
-                tokens_per_expert_group.sum(dim=0).cpu().item(), sorted_tokens.shape[1]
-            )
-            input_split_sizes = tokens_per_ep_rank.cpu().numpy().tolist()
-            dist.all_to_all(
-                list(gathered_tokens.split(output_splits)),
-                list(sorted_tokens.split(input_split_sizes)),
-            )
-            tokens_per_expert_post_gather = tokens_per_expert_group.view(
-                self.ep_size, self.experts_per_rank
-            ).sum(dim=0)
-            gatherd_idxs = np.zeros(shape=(gathered_tokens.shape[0],), dtype=np.int32)
-            s = 0
-            for i, k in enumerate(tokens_per_expert_group.cpu().numpy()):
-                gatherd_idxs[s : s + k] = i % self.experts_per_rank
-                s += k
-            gatherd_idxs = gatherd_idxs.argsort()
-            sorted_tokens = gathered_tokens[gatherd_idxs]
-            tokens_per_expert = tokens_per_expert_post_gather
         tokens_per_expert = tokens_per_expert.cpu().numpy()
 
         outputs = []
@@ -647,15 +594,6 @@ class DeepseekV2MoE(nn.Module):
             start_idx = end_idx
 
         outs = torch.cat(outputs, dim=0) if len(outputs) else sorted_tokens.new_empty(0)
-        if self.ep_size > 1:
-            new_x = torch.empty_like(outs)
-            new_x[gatherd_idxs] = outs
-            gathered_tokens = new_x.new_empty(*sorted_tokens_shape)
-            dist.all_to_all(
-                list(gathered_tokens.split(input_split_sizes)),
-                list(new_x.split(output_splits)),
-            )
-            outs = gathered_tokens
 
         new_x = torch.empty_like(outs)
         new_x[idxs] = outs
