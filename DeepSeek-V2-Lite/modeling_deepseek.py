@@ -71,6 +71,7 @@ if is_torch_fx_available():
 
     _prepare_4d_causal_attention_mask = torch.fx.wrap(_prepare_4d_causal_attention_mask)
 
+_do_print_ = False
 
 logger = logging.get_logger(__name__)
 
@@ -397,8 +398,9 @@ class DeepseekV2MLP(nn.Module):
 
     def forward(self, x):
         name = self.name if self.name else "MLP"
-        print(y_str(f"\tRunning ") + f"{name} " 
-              + y_str(f"for layer ") + f"{self.layer_idx}")
+        if _do_print_:
+            print(y_str(f"\tRunning ") + f"{name} " 
+                + y_str(f"for layer ") + f"{self.layer_idx}")
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
 
@@ -560,8 +562,26 @@ class DeepseekV2MoE(nn.Module):
                 config=config, intermediate_size=intermediate_size,
                 layer_idx=layer_idx, name="shared_experts"
             )
-
+            
+        self.first_run = True
+            
+            
+    # Smart MoE Caching functions
+    def get_expert_device(self, expert_id):
+        return self.experts[expert_id].gate_proj.weight.device
+    
+    def set_expert_device(self, expert_id, device):
+        if self.get_expert_device(expert_id) != device:
+            self.experts[expert_id].to(device)
+        
+    def set_all_expert_device(self, device):
+        for i in range(len(self.experts)):
+            self.set_expert_device(i, device)
+        
     def forward(self, hidden_states):
+        if self.first_run:
+            self.set_all_expert_device(torch.device("cpu"))
+            self.first_run = False
         identity = hidden_states
         orig_shape = hidden_states.shape
         topk_idx, topk_weight, aux_loss = self.gate(hidden_states)
@@ -580,6 +600,10 @@ class DeepseekV2MoE(nn.Module):
         sorted_tokens = x[idxs // topk_ids.shape[1]]
         sorted_tokens_shape = sorted_tokens.shape
         tokens_per_expert = tokens_per_expert.cpu().numpy()
+        
+        for i, num_tokens in enumerate(tokens_per_expert):
+            if num_tokens != 0:
+                self.set_expert_device(i, sorted_tokens.device)
 
         outputs = []
         start_idx = 0
@@ -604,6 +628,7 @@ class DeepseekV2MoE(nn.Module):
             .sum(dim=1)
             .type(new_x.dtype)
         )
+
         return final_out
 
 
@@ -1197,7 +1222,8 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         hidden_states = self.input_layernorm(hidden_states)
 
-        print(b_str(f"Running layer {self.layer_idx}"))
+        if _do_print_:
+            print(b_str(f"Running layer {self.layer_idx}"))
         # Self Attention
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
