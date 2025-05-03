@@ -2,17 +2,20 @@ import torch
 from collections import OrderedDict
 import time
 import threading
+from typing import Union, List
 
 
 class VTensor:
     """
     A virtual tensor class for coarse-grained tensor virtualization.
-    Manages a full tensor on CPU and a cache on GPU.
+    Manages one or multiple full tensors on CPU and corresponding caches on GPU.
+    If multiple tensors are provided, they must share the first dimension, and
+    corresponding slices are always moved and accessed together.
     """
 
     def __init__(
         self,
-        full_tensor_cpu: torch.Tensor,
+        full_tensors_cpu: Union[torch.Tensor, List[torch.Tensor]],
         cache_budget: int,
         device: torch.device = torch.device("cuda:0"),
     ):
@@ -20,52 +23,85 @@ class VTensor:
         Initializes the VTensor.
 
         Args:
-            full_tensor_cpu: The complete tensor residing on the CPU. The first dimension is the virtualized dimension.
-            cache_budget: The maximum number of slices (along the first dimension) to cache on the GPU.
+            full_tensors_cpu: A single complete tensor or a list of complete tensors
+                              residing on the CPU. The first dimension is the
+                              virtualized dimension and must be the same for all tensors
+                              if a list is provided.
+            cache_budget: The maximum number of slices (along the first dimension)
+                          to cache on the GPU.
             device: The target GPU device.
         """
-        if not isinstance(full_tensor_cpu, torch.Tensor):
-            raise TypeError("full_tensor_cpu must be a torch.Tensor")
-        if full_tensor_cpu.is_cuda:
-            raise ValueError("full_tensor_cpu must reside on the CPU")
-        if not isinstance(cache_budget, int) or cache_budget <= 0:
-            raise ValueError("cache_budget must be a positive integer")
-
-        self.full_tensor_cpu = full_tensor_cpu
-        self.cache_budget = min(
-            cache_budget, full_tensor_cpu.shape[0]
-        )  # Cannot cache more than available
-        self.device = device
-        self.dtype = full_tensor_cpu.dtype
-        self.slice_shape = full_tensor_cpu.shape[1:]
-        self.num_slices = full_tensor_cpu.shape[0]
-
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is required for VTensor GPU caching.")
+
+        self.is_multi_tensor = not isinstance(full_tensors_cpu, torch.Tensor)
+
+        if self.is_multi_tensor:
+            if not full_tensors_cpu: # Check if list is empty
+                raise ValueError("Input tensor list cannot be empty.")
+            self.full_tensors_cpu = full_tensors_cpu
+            # Validations for list input
+            first_tensor = self.full_tensors_cpu[0]
+            if not isinstance(first_tensor, torch.Tensor):
+                 raise TypeError("All elements in full_tensors_cpu list must be torch.Tensor")
+            if first_tensor.is_cuda:
+                raise ValueError("All input tensors must reside on the CPU")
+
+            self.num_slices = first_tensor.shape[0]
+            self.dtype = first_tensor.dtype
+            self.slice_shapes = [t.shape[1:] for t in self.full_tensors_cpu]
+
+            for i, t in enumerate(self.full_tensors_cpu[1:], 1):
+                 if not isinstance(t, torch.Tensor):
+                     raise TypeError(f"Element {i} in full_tensors_cpu list is not a torch.Tensor")
+                 if t.is_cuda:
+                     raise ValueError(f"Tensor {i} in the list must reside on the CPU")
+                 if t.shape[0] != self.num_slices:
+                     raise ValueError(f"Tensor {i} has mismatching first dimension: expected {self.num_slices}, got {t.shape[0]}")
+                 if t.dtype != self.dtype:
+                     raise ValueError(f"Tensor {i} has mismatching dtype: expected {self.dtype}, got {t.dtype}")
+
+        else: # Single tensor input
+            if not isinstance(full_tensors_cpu, torch.Tensor):
+                 raise TypeError("full_tensors_cpu must be a torch.Tensor or list of torch.Tensor")
+            if full_tensors_cpu.is_cuda:
+                raise ValueError("Input tensor must reside on the CPU")
+            self.full_tensors_cpu = [full_tensors_cpu] # Store as list internally for consistency
+            self.num_slices = self.full_tensors_cpu[0].shape[0]
+            self.dtype = self.full_tensors_cpu[0].dtype
+            self.slice_shapes = [self.full_tensors_cpu[0].shape[1:]]
+
+
+        self.cache_budget = min(
+            cache_budget, self.num_slices
+        )  # Cannot cache more than available
+        self.device = device
+
+        # Set CUDA device
         if isinstance(self.device, torch.device):
-            torch.cuda.set_device(
-                self.device
-            )  # Ensure operations happen on the correct device
+            torch.cuda.set_device(self.device)
         elif isinstance(self.device, int):
             torch.cuda.set_device(self.device)
         else:
-            # Default to device 0 if not specified correctly
             torch.cuda.set_device(0)
             self.device = torch.device("cuda:0")
 
-        # Allocate GPU cache
-        self.on_gpu_tensor = torch.empty(
-            (self.cache_budget, *self.slice_shape),
-            dtype=self.dtype,
-            device=self.device,
-        )
+        # Allocate GPU caches (as a list)
+        self.on_gpu_tensors = []
+        for shape in self.slice_shapes:
+            gpu_cache = torch.empty(
+                (self.cache_budget, *shape),
+                dtype=self.dtype,
+                device=self.device,
+            )
+            self.on_gpu_tensors.append(gpu_cache)
 
-        # Mappings and tracking
+        # Mappings and tracking (remain the same, track slice indices)
         self.mapping = {}  # original_id -> cache_index
         self.inverse_mapping = {}  # cache_index -> original_id
         self.free_gpu_indices = list(
             range(self.cache_budget)
-        )  # Indices available in on_gpu_tensor
+        )  # Indices available in on_gpu_tensor slots
         self.lru_order = (
             OrderedDict()
         )  # original_id -> None, ordered by access (least recent first)
@@ -77,11 +113,14 @@ class VTensor:
         )  # Protect concurrent prefetch calls if needed
 
         print(
-            f"VTensor initialized: Total Slices={self.num_slices}, Cache Budget={self.cache_budget}, Slice Shape={self.slice_shape}, Device={self.device}"
+            f"VTensor initialized: {'Multi-tensor' if self.is_multi_tensor else 'Single-tensor'}, "
+            f"Num Tensors={len(self.full_tensors_cpu)}, Total Slices={self.num_slices}, "
+            f"Cache Budget={self.cache_budget}, Slice Shapes={[list(s) for s in self.slice_shapes]}, "
+            f"Device={self.device}"
         )
 
     def _evict_one(self):
-        """Evicts the least recently used slice."""
+        """Evicts the least recently used slice (frees one cache index across all tensors)."""
         if not self.lru_order:
             raise RuntimeError(
                 "Attempting to evict from an empty cache (this shouldn't happen if cache is full)."
@@ -98,7 +137,7 @@ class VTensor:
 
     def async_prefetch(self, original_ids: list[int]):
         """
-        Asynchronously prefetches specified slices from CPU to GPU.
+        Asynchronously prefetches specified slices from CPU to GPU for all managed tensors.
         Evicts least recently used slices if the cache is full.
 
         Args:
@@ -200,10 +239,11 @@ class VTensor:
 
                     target_cache_index = self.free_gpu_indices.pop(0)
 
-                    # Perform the non-blocking copy
-                    self.on_gpu_tensor[target_cache_index].copy_(
-                        self.full_tensor_cpu[original_id], non_blocking=True
-                    )
+                    # Perform the non-blocking copy for *each* tensor
+                    for i in range(len(self.full_tensors_cpu)):
+                        self.on_gpu_tensors[i][target_cache_index].copy_(
+                            self.full_tensors_cpu[i][original_id], non_blocking=True
+                        )
 
                     # Update mappings *after* copy is issued
                     self.mapping[original_id] = target_cache_index
@@ -217,16 +257,16 @@ class VTensor:
 
             # print(f"Prefetch issued for {len(ids_to_fetch)} items. Cache size: {len(self.mapping)}/{self.cache_budget}")
 
-    def get(self, original_id: int) -> torch.Tensor:
+    def get(self, original_id: int) -> Union[torch.Tensor, List[torch.Tensor]]:
         """
-        Retrieves a slice of the tensor by its original index.
-        If the slice is not on the GPU, it's fetched from the CPU (potentially evicting another slice).
+        Retrieves a slice (or list of slices if multi-tensor) by its original index.
+        If the slice is not on the GPU, it's fetched from the CPU for all tensors.
 
         Args:
             original_id: The original index of the slice to retrieve.
 
         Returns:
-            The requested tensor slice residing on the GPU.
+            The requested tensor slice (or list of slices) residing on the GPU.
         """
         if not (0 <= original_id < self.num_slices):
             raise IndexError(
@@ -249,7 +289,9 @@ class VTensor:
             self.lru_order.move_to_end(
                 original_id
             )  # Mark as most recently used
-            return self.on_gpu_tensor[cache_index]
+            # Return list or single tensor based on initialization
+            result = [gpu_cache[cache_index] for gpu_cache in self.on_gpu_tensors]
+            return result if self.is_multi_tensor else result[0]
         else:
             # Cache Miss
             # print(f"Cache Miss: ID {original_id}")
@@ -271,10 +313,11 @@ class VTensor:
                 )
             target_cache_index = self.free_gpu_indices.pop(0)
 
-            # Fetch from CPU to GPU (synchronously for 'get')
-            # Use default stream implicitly for synchronous copy
-            slice_to_copy = self.full_tensor_cpu[original_id]
-            self.on_gpu_tensor[target_cache_index].copy_(slice_to_copy)
+            # Fetch from CPU to GPU (synchronously for 'get') for *all* tensors
+            # Use default stream implicitly
+            for i in range(len(self.full_tensors_cpu)):
+                slice_to_copy = self.full_tensors_cpu[i][original_id]
+                self.on_gpu_tensors[i][target_cache_index].copy_(slice_to_copy)
 
             # Update mappings and LRU
             self.mapping[original_id] = target_cache_index
@@ -283,7 +326,9 @@ class VTensor:
             self.lru_order.move_to_end(original_id)
             # print(f"Fetched ID {original_id} to cache_index {target_cache_index}. Cache size: {len(self.mapping)}/{self.cache_budget}")
 
-            return self.on_gpu_tensor[target_cache_index]
+            # Return list or single tensor based on initialization
+            result = [gpu_cache[target_cache_index] for gpu_cache in self.on_gpu_tensors]
+            return result if self.is_multi_tensor else result[0]
 
     def synchronize_prefetch(self):
         """Synchronizes the dedicated prefetch stream."""
@@ -300,8 +345,9 @@ if __name__ == "__main__":
 
     # --- Configuration ---
     num_total_slices = 20
-    slice_dim1 = 128
-    slice_dim2 = 256
+    # Increase slice dimensions to make data transfer more significant
+    slice_dim1 = 1024 
+    slice_dim2 = 2048 
     cache_sz = 5
     device = torch.device("cuda:0")
 
@@ -416,15 +462,16 @@ if __name__ == "__main__":
     # --- Overlap Test: Prefetch + Computation ---
     print("\n--- Overlap Test (Prefetch + MatMul) ---")
 
-    # Reset VTensor state for a predictable overlap scenario
-    v_tensor = VTensor(full_cpu_tensor, cache_budget=cache_sz, device=device)
-    print("VTensor reset for overlap test.")
+    # Reset VTensor state using a SINGLE tensor for this specific test
+    # To avoid complexity in handling list returns within the timing loop
+    v_tensor_single = VTensor(full_cpu_tensor, cache_budget=cache_sz, device=device)
+    print("VTensor (single) reset for overlap test.")
 
     # Setup: Some initial items in cache
     initial_ids = [0, 1]
     for i_id in initial_ids:
-        _ = v_tensor.get(i_id)
-    print(f"Initial cache state: {v_tensor.mapping.keys()}")
+        _ = v_tensor_single.get(i_id) # Use the single-tensor instance
+    print(f"Initial cache state: {v_tensor_single.mapping.keys()}")
 
     # Prepare data for computation (on GPU, independent of VTensor cache)
     mat_A = torch.randn(slice_dim1, 512, device=device)
@@ -450,60 +497,57 @@ if __name__ == "__main__":
     comp_time = comp_start.elapsed_time(comp_end)
     print(f"Computation finished. Time: {comp_time:.4f} ms")
 
-    # 2. Prefetch (after computation)
+    # 2. Prefetch (after computation) - Use the single-tensor instance
     pref_start = torch.cuda.Event(enable_timing=True)
     pref_end = torch.cuda.Event(enable_timing=True)
     torch.cuda.synchronize()
-    pref_start.record(v_tensor.stream)
-    v_tensor.async_prefetch(overlap_prefetch_ids)
-    pref_end.record(v_tensor.stream)
-    v_tensor.synchronize_prefetch()  # Wait for prefetch
+    pref_start.record(v_tensor_single.stream)
+    v_tensor_single.async_prefetch(overlap_prefetch_ids)
+    pref_end.record(v_tensor_single.stream)
+    v_tensor_single.synchronize_prefetch() # Wait for prefetch
     pref_time = pref_start.elapsed_time(pref_end)
     print(f"Prefetch finished. Time: {pref_time:.4f} ms")
     total_sequential_time = comp_time + pref_time
     print(f"Total sequential time: {total_sequential_time:.4f} ms")
 
-    # --- Timing with overlap ---
+
+    # --- Timing with overlap --- Use the single-tensor instance
     print("\nTiming: Computation and Prefetch Concurrently")
-    # Reset VTensor state again
-    v_tensor = VTensor(full_cpu_tensor, cache_budget=cache_sz, device=device)
+    v_tensor_single = VTensor(full_cpu_tensor, cache_budget=cache_sz, device=device)
     for i_id in initial_ids:
-        _ = v_tensor.get(i_id)  # Reset initial state
-    print(f"VTensor reset. Initial cache state: {v_tensor.mapping.keys()}")
+        _ = v_tensor_single.get(i_id)
+    print(f"VTensor (single) reset. Initial cache state: {v_tensor_single.mapping.keys()}")
 
     overall_start = torch.cuda.Event(enable_timing=True)
-    prefetch_done_event = torch.cuda.Event(enable_timing=True)
-    compute_done_event = torch.cuda.Event(enable_timing=True)
+    prefetch_end_event = torch.cuda.Event(enable_timing=True)
+    compute_end_event = torch.cuda.Event(enable_timing=True)
     overall_end = torch.cuda.Event(enable_timing=True)
+    default_stream = torch.cuda.current_stream(device=device)
 
-    torch.cuda.synchronize()  # Ensure idle start
-    overall_start.record()
+    torch.cuda.synchronize() 
+    overall_start.record(default_stream)
 
-    # Start prefetch on its stream
-    v_tensor.async_prefetch(overlap_prefetch_ids)
-    prefetch_done_event.record(
-        v_tensor.stream
-    )  # Record when prefetch *commands* are done on its stream
+    # Start prefetch on its stream (using single-tensor instance)
+    with torch.cuda.stream(v_tensor_single.stream):
+        v_tensor_single.async_prefetch(overlap_prefetch_ids)
+        prefetch_end_event.record(v_tensor_single.stream)
 
     # Start computation on the default stream
-    result_overlap = torch.matmul(mat_A, mat_B)
-    compute_done_event.record()  # Record when computation is done on default stream
+    with torch.cuda.stream(default_stream):
+        result_overlap = torch.matmul(mat_A, mat_B)
+        compute_end_event.record(default_stream)
+        default_stream.wait_event(prefetch_end_event)
+        overall_end.record(default_stream)
 
-    # Wait for both to complete
-    prefetch_done_event.synchronize()
-    compute_done_event.synchronize()
-    overall_end.record()  # Record when both are finished
-    torch.cuda.synchronize()  # Final sync just to be sure for timing calc
-
+    overall_end.synchronize()
     total_overlap_time = overall_start.elapsed_time(overall_end)
-    # We can also measure individual times if needed using the intermediate events
 
     print(f"Prefetch and Computation issued concurrently.")
-    print(f"Waiting for both streams to complete...")
+    print(f"Waiting for default stream to complete (after waiting for prefetch)...)")
     print(f"Both finished. Total concurrent time: {total_overlap_time:.4f} ms")
 
     print(f"\nSequential Time: {total_sequential_time:.4f} ms")
-    print(f"Concurrent Time: {total_overlap_time:.4f} ms")
+    print(f"Concurrent Time: {total_overlap_time:.4f} ms") # Print concurrent time here for comparison
 
     if (
         total_overlap_time < total_sequential_time * 0.95
@@ -517,15 +561,82 @@ if __name__ == "__main__":
             "         This can happen on some GPUs or if tasks are too short."
         )
 
-    # Verify correctness of overlapped result and prefetched data
     assert torch.equal(result_comp, result_overlap)
     print("Computation result consistent.")
-    print("Verifying prefetched data after overlap...")
+    print("Verifying prefetched data after overlap (using single-tensor instance)...")
     for pid in overlap_prefetch_ids:
-        if pid < v_tensor.num_slices:
-            slice_o = v_tensor.get(pid)  # Should be a hit now
-            assert pid in v_tensor.mapping
-            assert torch.equal(slice_o.cpu(), full_cpu_tensor[pid])
+        if pid < v_tensor_single.num_slices:
+             slice_o = v_tensor_single.get(pid) # Get from single-tensor instance
+             assert pid in v_tensor_single.mapping
+             assert torch.equal(slice_o.cpu(), v_tensor_single.full_tensors_cpu[0][pid])
     print("Prefetched data verified successfully after overlap.")
+
+    # --- Multi-Tensor Test --- 
+    print("\n--- Multi-Tensor Test ---")
+    # Create multiple tensors for testing
+    num_multi = 3
+    slice_shapes_multi = [
+        (slice_dim1 // 2, slice_dim2), 
+        (slice_dim1, slice_dim2 // 2),
+        (slice_dim1, slice_dim2)
+    ]
+    full_cpu_tensors_multi = [
+        torch.randn(num_total_slices, *s_shape, dtype=torch.float32)
+        for s_shape in slice_shapes_multi
+    ]
+    print(f"Created {num_multi} tensors for multi-tensor test.")
+
+    # Instantiate with list
+    v_tensor_multi = VTensor(full_cpu_tensors_multi, cache_budget=cache_sz, device=device)
+
+    # Test get (miss)
+    print("\nGetting slice 0 (miss) - multi-tensor...")
+    slices_0_multi = v_tensor_multi.get(0)
+    assert isinstance(slices_0_multi, list)
+    assert len(slices_0_multi) == num_multi
+    print(f"Got {len(slices_0_multi)} slices.")
+    for i in range(num_multi):
+        assert slices_0_multi[i].device == device
+        assert slices_0_multi[i].shape == v_tensor_multi.on_gpu_tensors[i].shape[1:]
+        assert torch.equal(slices_0_multi[i].cpu(), full_cpu_tensors_multi[i][0])
+    print("Multi-tensor get (miss) successful.")
+    print("Mapping:", v_tensor_multi.mapping)
+    print("LRU:", list(v_tensor_multi.lru_order.keys()))
+
+    # Test get (hit)
+    print("\nGetting slice 0 (hit) - multi-tensor...")
+    slices_0_multi_again = v_tensor_multi.get(0)
+    assert isinstance(slices_0_multi_again, list)
+    assert len(slices_0_multi_again) == num_multi
+    print(f"Got {len(slices_0_multi_again)} slices.")
+    for i in range(num_multi):
+        assert slices_0_multi_again[i].data_ptr() == slices_0_multi[i].data_ptr()
+        assert torch.equal(slices_0_multi_again[i].cpu(), full_cpu_tensors_multi[i][0])
+    print("Multi-tensor get (hit) successful.")
+    print("Mapping:", v_tensor_multi.mapping)
+    print("LRU:", list(v_tensor_multi.lru_order.keys())) # Should be [0]
+
+    # Test prefetch
+    prefetch_ids_multi = [1, 2, 3]
+    print(f"\nPrefetching IDs {prefetch_ids_multi} (multi-tensor)...")
+    v_tensor_multi.async_prefetch(prefetch_ids_multi)
+    v_tensor_multi.synchronize_prefetch()
+    print("Multi-tensor prefetch synchronized.")
+    print("Mapping:", v_tensor_multi.mapping)
+    print("LRU:", list(v_tensor_multi.lru_order.keys())) # Prefetch adds but doesn't reorder yet
+
+    # Test get after prefetch (should be hits)
+    for pid in prefetch_ids_multi:
+        print(f"\nGetting prefetched slice {pid} (hit) - multi-tensor...")
+        slices_p_multi = v_tensor_multi.get(pid)
+        assert isinstance(slices_p_multi, list)
+        assert len(slices_p_multi) == num_multi
+        assert pid in v_tensor_multi.mapping
+        print(f"Got {len(slices_p_multi)} slices for ID {pid}.")
+        for i in range(num_multi):
+            assert torch.equal(slices_p_multi[i].cpu(), full_cpu_tensors_multi[i][pid])
+    print("Multi-tensor get after prefetch successful.")
+    print("Mapping:", v_tensor_multi.mapping)
+    print("LRU:", list(v_tensor_multi.lru_order.keys())) # Now order should reflect gets
 
     print("\nVTensor Unit Test Completed.")
