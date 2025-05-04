@@ -20,7 +20,11 @@
 """ PyTorch DeepSeek model."""
 import math
 import warnings
+import os
+import time
+import json
 from typing import List, Optional, Tuple, Union
+from .vtensor import VTensor
 
 import torch
 import torch.nn.functional as F
@@ -396,7 +400,7 @@ class DeepseekV2MLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def forward(self, x):
+    def forward(self, x, vtensors=None):
         name = self.name if self.name else "MLP"
         if _do_print_:
             print(y_str(f"\tRunning ") + f"{name} " 
@@ -565,30 +569,47 @@ class DeepseekV2MoE(nn.Module):
             
         self.first_run = True
             
-            
-    # Smart MoE Caching functions
-    def get_expert_device(self, expert_id):
-        return self.experts[expert_id].gate_proj.weight.device
-    
-    def set_expert_device(self, expert_id, device):
-        if self.get_expert_device(expert_id) != device:
-            self.experts[expert_id].to(device)
-        
-    def set_all_expert_device(self, device):
-        for i in range(len(self.experts)):
-            self.set_expert_device(i, device)
-        
-    def forward(self, hidden_states):
+
+    def forward(self, hidden_states, vtensors=None):
         if self.first_run:
-            self.set_all_expert_device(torch.device("cpu"))
+            expert_gate_w = torch.empty(
+                self.experts_per_rank, *self.experts[0].gate_proj.weight.shape,
+                dtype=self.experts[0].gate_proj.weight.dtype,
+                device=torch.device("cpu"),
+            )
+            expert_up_w = torch.empty(
+                self.experts_per_rank, *self.experts[0].up_proj.weight.shape,
+                dtype=self.experts[0].up_proj.weight.dtype,
+                device=torch.device("cpu"),
+            )
+            expert_down_w = torch.empty(
+                self.experts_per_rank, *self.experts[0].down_proj.weight.shape,
+                dtype=self.experts[0].down_proj.weight.dtype,
+                device=torch.device("cpu"),
+            )
+            for i in range(self.experts_per_rank):
+                expert_gate_w[i] = self.experts[i].gate_proj.weight.to("cpu")
+                expert_up_w[i] = self.experts[i].up_proj.weight.to("cpu")
+                expert_down_w[i] = self.experts[i].down_proj.weight.to("cpu")
+                del self.experts[i].gate_proj.weight
+                del self.experts[i].up_proj.weight
+                del self.experts[i].down_proj.weight
+                self.experts[i].gate_proj.weight = None
+                self.experts[i].up_proj.weight = None
+                self.experts[i].down_proj.weight = None
+            torch.cuda.empty_cache()
+            self.vtensor = VTensor([expert_gate_w, expert_up_w, expert_down_w],
+                                   cache_budget=self.experts_per_rank//4)
             self.first_run = False
-        identity = hidden_states
-        orig_shape = hidden_states.shape
-        topk_idx, topk_weight, aux_loss = self.gate(hidden_states)
-        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-        y = self.moe_infer(hidden_states, topk_idx, topk_weight).view(*orig_shape)
-        if self.config.n_shared_experts is not None:
-            y = y + self.shared_experts(identity)
+            y = hidden_states
+        else:
+            identity = hidden_states
+            orig_shape = hidden_states.shape
+            topk_idx, topk_weight, aux_loss = self.gate(hidden_states)
+            hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+            y = self.moe_infer(hidden_states, topk_idx, topk_weight).view(*orig_shape)
+            if self.config.n_shared_experts is not None:
+                y = y + self.shared_experts(identity)
         return y
 
     @torch.no_grad()
@@ -603,7 +624,10 @@ class DeepseekV2MoE(nn.Module):
         
         for i, num_tokens in enumerate(tokens_per_expert):
             if num_tokens != 0:
-                self.set_expert_device(i, sorted_tokens.device)
+                gate_up_down_w = self.vtensor.get(i)
+                self.experts[i].gate_proj.weight = gate_up_down_w[0]
+                self.experts[i].up_proj.weight = gate_up_down_w[1]
+                self.experts[i].down_proj.weight = gate_up_down_w[2]
 
         outputs = []
         start_idx = 0
@@ -611,7 +635,7 @@ class DeepseekV2MoE(nn.Module):
             end_idx = start_idx + num_tokens
             if num_tokens == 0:
                 continue
-            expert = self.experts[i + self.ep_rank * self.experts_per_rank]
+            expert = self.experts[i]
             tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
             expert_out = expert(tokens_for_this_expert)
             outputs.append(expert_out)
@@ -1196,6 +1220,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
+        vtensors: Optional[VTensor] = None,
         **kwargs,
     ) -> Tuple[
         torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
@@ -1239,7 +1264,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, vtensors=vtensors)
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
@@ -1416,6 +1441,7 @@ class DeepseekV2Model(DeepseekV2PreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        step_idx: Optional[int] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = (
             output_attentions
@@ -1494,9 +1520,10 @@ class DeepseekV2Model(DeepseekV2PreTrainedModel):
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
+        vtensors = {}
         next_decoder_cache = None
 
-        for decoder_layer in self.layers:
+        for i, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -1518,9 +1545,12 @@ class DeepseekV2Model(DeepseekV2PreTrainedModel):
                     past_key_value=past_key_values,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
+                    vtensors=vtensors,
                 )
 
             hidden_states = layer_outputs[0]
+            if isinstance(decoder_layer.mlp, DeepseekV2MoE):
+                vtensors[i] = decoder_layer.mlp.vtensor
 
             if use_cache:
                 next_decoder_cache = layer_outputs[2 if output_attentions else 1]
@@ -1552,7 +1582,7 @@ class DeepseekV2Model(DeepseekV2PreTrainedModel):
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
-        )
+        ), vtensors
 
 
 class DeepseekV2ForCausalLM(DeepseekV2PreTrainedModel):
@@ -1563,9 +1593,13 @@ class DeepseekV2ForCausalLM(DeepseekV2PreTrainedModel):
         self.model = DeepseekV2Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.runs = 0
+        self.steps = 0
+        rand_num = str(int(time.time()))[:-5]
+        self.out_path = f"run_{rand_num}"
+        os.makedirs(self.out_path, exist_ok=True)
         # Initialize weights and apply final processing
-        print(g_str("Initializing CS262 DeepSeek V2 Model"))
+        print(g_str("Initializing CS262 DeepSeek V2 Model: ") + 
+              f"Saving stats to " + r_str(f"{self.out_path}"))
         
         self.post_init()
 
@@ -1642,11 +1676,11 @@ class DeepseekV2ForCausalLM(DeepseekV2PreTrainedModel):
         return_dict = (
             return_dict if return_dict is not None else self.config.use_return_dict
         )
-        print(g_str("Running run ") + str(self.runs))
-        self.runs += 1
-
+        print(y_str("Running step ") + str(self.steps))
+        self.steps += 1
+        start_time = time.time()
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        outputs = self.model(
+        outputs, vtensors = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -1656,12 +1690,20 @@ class DeepseekV2ForCausalLM(DeepseekV2PreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            step_idx=self.steps
         )
-
+        time_taken = time.time() - start_time
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
         logits = logits.float()
-
+        
+        stats = {"step_idx": self.steps, "time_taken": time_taken}
+        for key, vtensor in vtensors.items():
+            stats[f"vtensor_{key}"] = vtensor.get_stats()
+        out_path = self.out_path + f"/step_{self.steps}.json"
+        with open(out_path, "w") as f:
+            json.dump(stats, f, indent=4)
+        
         loss = None
         if labels is not None:
             # Shift so that tokens < n predict n

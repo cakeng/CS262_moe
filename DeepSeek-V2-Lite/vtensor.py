@@ -90,9 +90,9 @@ class VTensor:
         self.on_gpu_tensors = []
         for shape in self.slice_shapes:
             gpu_cache = torch.empty(
-                (self.cache_budget, *shape),
+                self.cache_budget, *shape,
                 dtype=self.dtype,
-                device=self.device,
+                device=self.device
             )
             self.on_gpu_tensors.append(gpu_cache)
 
@@ -118,7 +118,22 @@ class VTensor:
             f"Cache Budget={self.cache_budget}, Slice Shapes={[list(s) for s in self.slice_shapes]}, "
             f"Device={self.device}"
         )
-
+        self._reset_stats()  # Initialize stats
+        
+    def _reset_stats(self):
+        self.stats = {
+            "num_slices": str(self.num_slices),
+            "cache_budget": str(self.cache_budget),
+            "slice_shapes": str(self.slice_shapes),
+            "device": str(self.device),
+            "prefetch_requested": "None",
+            "mapping": "None",
+            "lru_order": "None",
+            "free_gpu_indices": "None",
+            "get_requested": "None",
+            "cache_hit": "None",
+        }
+        
     def _evict_one(self):
         """Evicts the least recently used slice (frees one cache index across all tensors)."""
         if not self.lru_order:
@@ -143,6 +158,9 @@ class VTensor:
         Args:
             original_ids: A list of original slice indices to prefetch.
         """
+        if self.stats.get("prefetch_requested") == "None":
+            self.stats["prefetch_requested"] = []
+        self.stats["prefetch_requested"].append(original_ids)
         with self._prefetch_lock:  # Ensure atomicity for this operation
             ids_to_fetch = []
             for original_id in original_ids:
@@ -268,6 +286,10 @@ class VTensor:
         Returns:
             The requested tensor slice (or list of slices) residing on the GPU.
         """
+        if self.stats.get("get_requested") == "None":
+            self.stats["get_requested"] = []
+            self.stats["cache_hit"] = []
+        self.stats["get_requested"].append(original_id)
         if not (0 <= original_id < self.num_slices):
             raise IndexError(
                 f"Index {original_id} out of bounds for tensor with {self.num_slices} slices."
@@ -284,6 +306,7 @@ class VTensor:
         cache_index = self.mapping.get(original_id)
 
         if cache_index is not None:
+            self.stats["cache_hit"].append("True")
             # Cache Hit
             # print(f"Cache Hit: ID {original_id} at cache_index {cache_index}")
             self.lru_order.move_to_end(
@@ -293,6 +316,7 @@ class VTensor:
             result = [gpu_cache[cache_index] for gpu_cache in self.on_gpu_tensors]
             return result if self.is_multi_tensor else result[0]
         else:
+            self.stats["cache_hit"].append("False")
             # Cache Miss
             # print(f"Cache Miss: ID {original_id}")
 
@@ -325,7 +349,7 @@ class VTensor:
             self.lru_order[original_id] = None  # Add as most recently used
             self.lru_order.move_to_end(original_id)
             # print(f"Fetched ID {original_id} to cache_index {target_cache_index}. Cache size: {len(self.mapping)}/{self.cache_budget}")
-
+            hit_rate = len(self.mapping) / self.num_slices
             # Return list or single tensor based on initialization
             result = [gpu_cache[target_cache_index] for gpu_cache in self.on_gpu_tensors]
             return result if self.is_multi_tensor else result[0]
@@ -334,6 +358,14 @@ class VTensor:
         """Synchronizes the dedicated prefetch stream."""
         self.stream.synchronize()
 
+    def get_stats(self):
+        """Updates the statistics of the VTensor."""
+        self.stats["mapping"] = str(self.mapping)
+        self.stats["lru_order"] = str(self.lru_order)
+        self.stats["free_gpu_indices"] = str(self.free_gpu_indices)
+        out_stats = self.stats.copy()
+        self._reset_stats()  # Reset stats after retrieval
+        return out_stats
 
 # Unit Test Section
 if __name__ == "__main__":
