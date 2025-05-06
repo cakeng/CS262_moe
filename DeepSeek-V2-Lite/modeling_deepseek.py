@@ -599,7 +599,7 @@ class DeepseekV2MoE(nn.Module):
                 self.experts[i].down_proj.weight = None
             torch.cuda.empty_cache()
             self.vtensor = VTensor([expert_gate_w, expert_up_w, expert_down_w],
-                                   cache_budget=self.experts_per_rank//4)
+                                   cache_budget=self.experts_per_rank//2)
             self.first_run = False
             y = hidden_states
         else:
@@ -1584,7 +1584,6 @@ class DeepseekV2Model(DeepseekV2PreTrainedModel):
             attentions=all_self_attns,
         ), vtensors
 
-
 class DeepseekV2ForCausalLM(DeepseekV2PreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
 
@@ -1594,7 +1593,7 @@ class DeepseekV2ForCausalLM(DeepseekV2PreTrainedModel):
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.steps = 0
-        rand_num = str(int(time.time()))[:-5]
+        rand_num = str(int(time.time()))[-6:]
         self.out_path = f"run_{rand_num}"
         os.makedirs(self.out_path, exist_ok=True)
         # Initialize weights and apply final processing
