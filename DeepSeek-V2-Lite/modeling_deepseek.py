@@ -61,6 +61,7 @@ from transformers.utils.import_utils import is_torch_fx_available
 from .configuration_deepseek import DeepseekV2Config
 import torch.distributed as dist
 import numpy as np
+import joblib # Added for loading the scaler
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
@@ -102,6 +103,11 @@ def _get_unpad_data(attention_mask):
         cu_seqlens,
         max_seqlen_in_batch,
     )
+
+from .lean_predictor import ExpertPredictionModel, predict_experts_from_hidden_state
+from sklearn.preprocessing import StandardScaler
+# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 
 class DeepseekV2RMSNorm(nn.Module):
@@ -568,9 +574,44 @@ class DeepseekV2MoE(nn.Module):
             )
             
         self.first_run = True
-            
+        self.predictor_model = ExpertPredictionModel(input_dim=2048, hidden_dims=[1024, 512, 256], output_dim=64)
+        # Load the state dictionary. Weights are likely float32 at this point.
+        # Using weights_only=True is recommended if 'best_expert_prediction_model.pt' is just a state_dict
+        try:
+            self.predictor_model.load_state_dict(torch.load('best_expert_prediction_model.pt', map_location='cpu', weights_only=True))
+        except TypeError: # Fallback for older PyTorch or if file isn't just weights
+             self.predictor_model.load_state_dict(torch.load('best_expert_prediction_model.pt', map_location='cpu'))
+        except FileNotFoundError:
+            logger.warning("Predictor model weights 'best_expert_prediction_model.pt' not found. Using random weights for predictor.")
+        
+        # Unconditionally convert the predictor model to bfloat16.
+        # This will also move it to the appropriate device if the model this MoE layer belongs to is on CUDA.
+        self.predictor_model.to(torch.bfloat16) 
+        
+        # Optional: Verification log (can be removed after confirming the fix)
+        # import logging
+        # logger = logging.getLogger(__name__)
+        # for name, param in self.predictor_model.named_parameters():
+        #     if param.dtype != torch.bfloat16:
+        #         logger.error(f"Predictor model param {name} is {param.dtype}, NOT bfloat16!")
+        #     else:
+        #         logger.info(f"Predictor model param {name} is {param.dtype}.")
 
-    def forward(self, hidden_states, vtensors=None):
+        # Load the scaler used during predictor training
+        try:
+            self.scaler = joblib.load('expert_predictor_scaler.gz')
+            logger.info("Successfully loaded 'expert_predictor_scaler.gz'.")
+        except FileNotFoundError:
+            logger.warning(
+                "Scaler file 'expert_predictor_scaler.gz' not found. "
+                "Predictions from ExpertPredictionModel will not be scaled. "
+                "This may lead to suboptimal performance if the model was trained with scaled inputs."
+            )
+            self.scaler = None
+        except Exception as e:
+            logger.error(f"Error loading 'expert_predictor_scaler.gz': {e}")
+            self.scaler = None
+
         if self.first_run:
             expert_gate_w = torch.empty(
                 self.experts_per_rank, *self.experts[0].gate_proj.weight.shape,
@@ -599,11 +640,35 @@ class DeepseekV2MoE(nn.Module):
                 self.experts[i].down_proj.weight = None
             torch.cuda.empty_cache()
             self.vtensor = VTensor([expert_gate_w, expert_up_w, expert_down_w],
-                                   cache_budget=self.experts_per_rank//4)
+                                   cache_budget=self.experts_per_rank//4) ## why by 4?
+       
+    def forward(self, hidden_states, vtensors=None):
+        if self.first_run:
             self.first_run = False
             y = hidden_states
         else:
             identity = hidden_states
+            # print(f"Identity shape: {identity.shape}") #Identity shape: torch.Size([1, 14, 2048])
+            
+            # Ensure the hidden state for prediction is on CPU and is a float32 numpy array
+            # as expected by predict_experts_from_hidden_state and the scaler
+            hidden_state_for_pred = identity[-1,-1,:].cpu().detach().to(torch.float32).numpy()
+            
+            
+            target_offset = 4
+            if self.layer_idx + target_offset in vtensors:
+                predicted_experts_four_layers_ahead = predict_experts_from_hidden_state(
+                hidden_state_for_pred, 
+                self.predictor_model,
+                scaler=self.scaler # Pass the loaded scaler
+                )
+                vtensors[self.layer_idx + target_offset].async_prefetch(predicted_experts_four_layers_ahead.tolist()) 
+            # self.vtensor.async_prefetch(predicted_experts_four_layers_ahead.tolist()) 
+                print("Async prefetch done")
+            # print(f"Predicted experts four layers ahead: {predicted_experts_four_layers_ahead}")
+            
+            # assert False
+
             orig_shape = hidden_states.shape
             topk_idx, topk_weight, aux_loss = self.gate(hidden_states)
             hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
@@ -1520,7 +1585,12 @@ class DeepseekV2Model(DeepseekV2PreTrainedModel):
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
-        vtensors = {}
+        # vtensors = {}
+        vtensors = {
+            idx: layer.mlp.vtensor
+           for idx, layer in enumerate(self.layers)         
+           if isinstance(layer.mlp, DeepseekV2MoE)
+        }
         next_decoder_cache = None
 
         for i, decoder_layer in enumerate(self.layers):
@@ -1538,6 +1608,8 @@ class DeepseekV2Model(DeepseekV2PreTrainedModel):
                     use_cache,
                 )
             else:
+                print(f"At layer {i}")
+                print(f"Length of vtensors: {len(vtensors)}")
                 layer_outputs = decoder_layer(
                     hidden_states,
                     attention_mask=attention_mask,
