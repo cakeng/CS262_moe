@@ -61,6 +61,7 @@ from transformers.utils.import_utils import is_torch_fx_available
 from .configuration_deepseek import DeepseekV2Config
 import torch.distributed as dist
 import numpy as np
+import joblib # Added for loading the scaler
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
@@ -102,6 +103,12 @@ def _get_unpad_data(attention_mask):
         cu_seqlens,
         max_seqlen_in_batch,
     )
+
+
+from .lean_predictor import ExpertPredictionModel, predict_experts_from_hidden_state
+from sklearn.preprocessing import StandardScaler
+# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 
 class DeepseekV2RMSNorm(nn.Module):
@@ -568,7 +575,31 @@ class DeepseekV2MoE(nn.Module):
             )
             
         self.first_run = True
-            
+        self.predictor_model = ExpertPredictionModel(input_dim=2048, hidden_dims=[1024, 512, 256], output_dim=64)
+        try:
+            self.predictor_model.load_state_dict(torch.load('best_expert_prediction_model.pt', map_location='cpu', weights_only=True))
+        except TypeError: # Fallback for older PyTorch or if file isn't just weights
+             self.predictor_model.load_state_dict(torch.load('best_expert_prediction_model.pt', map_location='cpu'))
+        except FileNotFoundError:
+            logger.warning("Predictor model weights 'best_expert_prediction_model.pt' not found. Using random weights for predictor.")
+        
+        # Unconditionally convert the predictor model to bfloat16.
+        # This will also move it to the appropriate device if the model this MoE layer belongs to is on CUDA.
+        self.predictor_model.to(torch.bfloat16) 
+        try:
+            self.scaler = joblib.load('expert_predictor_scaler.gz')
+            logger.info("Successfully loaded 'expert_predictor_scaler.gz'.")
+        except FileNotFoundError:
+            logger.warning(
+                "Scaler file 'expert_predictor_scaler.gz' not found. "
+                "Predictions from ExpertPredictionModel will not be scaled. "
+                "This may lead to suboptimal performance if the model was trained with scaled inputs."
+            )
+            self.scaler = None
+        except Exception as e:
+            logger.error(f"Error loading 'expert_predictor_scaler.gz': {e}")
+            self.scaler = None
+
 
     def forward(self, hidden_states, vtensors=None):
         if self.first_run:
@@ -604,6 +635,18 @@ class DeepseekV2MoE(nn.Module):
             y = hidden_states
         else:
             identity = hidden_states
+            hidden_state_for_pred = identity[-1,-1,:].cpu().detach().to(torch.float32).numpy()
+            target_offset = 4
+            if self.layer_idx + target_offset in vtensors:
+                predicted_experts_four_layers_ahead = predict_experts_from_hidden_state(
+                hidden_state_for_pred, 
+                self.predictor_model,
+                scaler=self.scaler, # Pass the loaded scaler,
+                top_k=2
+                )
+                vtensors[self.layer_idx + target_offset].async_prefetch(predicted_experts_four_layers_ahead.tolist()) 
+                # print("Async prefetch done")
+
             orig_shape = hidden_states.shape
             topk_idx, topk_weight, aux_loss = self.gate(hidden_states)
             hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
@@ -1422,6 +1465,7 @@ class DeepseekV2Model(DeepseekV2PreTrainedModel):
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
         self.post_init()
+        self.vtensors = {}
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -1520,10 +1564,14 @@ class DeepseekV2Model(DeepseekV2PreTrainedModel):
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
-        vtensors = {}
+        
         next_decoder_cache = None
 
         for i, decoder_layer in enumerate(self.layers):
+
+            # print(f"At layer {i}")
+            # print(f"Length of vtensors: {len(self.vtensors)}")
+
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -1545,12 +1593,12 @@ class DeepseekV2Model(DeepseekV2PreTrainedModel):
                     past_key_value=past_key_values,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
-                    vtensors=vtensors,
+                    vtensors=self.vtensors,
                 )
 
             hidden_states = layer_outputs[0]
             if isinstance(decoder_layer.mlp, DeepseekV2MoE):
-                vtensors[i] = decoder_layer.mlp.vtensor
+                self.vtensors[i] = decoder_layer.mlp.vtensor
 
             if use_cache:
                 next_decoder_cache = layer_outputs[2 if output_attentions else 1]
@@ -1582,7 +1630,7 @@ class DeepseekV2Model(DeepseekV2PreTrainedModel):
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
-        ), vtensors
+        ), self.vtensors
 
 class DeepseekV2ForCausalLM(DeepseekV2PreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
