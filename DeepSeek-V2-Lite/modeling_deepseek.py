@@ -573,21 +573,17 @@ class DeepseekV2MoE(nn.Module):
                 config=config, intermediate_size=intermediate_size,
                 layer_idx=layer_idx, name="shared_experts"
             )
-            
+        
+        self.target_offset = 8
         self.first_run = True
         self.main_block_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.predictor_model = ExpertPredictionModel(input_dim=2048, hidden_dims=[1024, 512, 256], output_dim=64)
-        try:
-            self.predictor_model.load_state_dict(torch.load('best_expert_prediction_model_new_8.pt', map_location=self.main_block_device, weights_only=True))
-        except TypeError: # Fallback for older PyTorch or if file isn't just weights
-             self.predictor_model.load_state_dict(torch.load('best_expert_prediction_model_new_8.pt', map_location=self.main_block_device))
-        except FileNotFoundError:
-            logger.warning("Predictor model weights 'best_expert_prediction_model_new_8.pt' not found. Using random weights for predictor.")
+        print (r_str(f"Layer {self.layer_idx}: ") + "Predictor model initialized.")
         
         # Unconditionally convert the predictor model to bfloat16.
         # This will also move it to the appropriate device if the model this MoE layer belongs to is on CUDA.
         self.predictor_model.to(torch.bfloat16) 
-        self.predictor_model.to(self.main_block_device)
+        # self.predictor_model.to(self.main_block_device)
         try:
             self.scaler = joblib.load('expert_predictor_scaler_8.gz')
             logger.info("Successfully loaded 'expert_predictor_scaler_8.gz'.")
@@ -622,6 +618,17 @@ class DeepseekV2MoE(nn.Module):
 
     def forward(self, hidden_states, cur_step=None, vtensors=None):
         if self.first_run:
+            try:
+                self.predictor_model.load_state_dict(torch.load('best_expert_prediction_model_new_8.pt', assign=True,
+                                                            map_location=self.main_block_device, weights_only=True))
+                print(r_str(f"Layer {self.layer_idx}: ") + "Successfully loaded 'best_expert_prediction_model_new_8.pt'.")
+            except TypeError: # Fallback for older PyTorch or if file isn't just weights
+                self.predictor_model.load_state_dict(torch.load('best_expert_prediction_model_new_8.pt', map_location=self.main_block_device))
+                print(r_str(f"Layer {self.layer_idx}: ") + "Loaded 'best_expert_prediction_model_new_8.pt' with fallback method.")
+            except FileNotFoundError:
+                logger.warning("Predictor model weights 'best_expert_prediction_model_new_8.pt' not found. Using random weights for predictor.")
+        
+            self.predictor_model = self.predictor_model.to(self.main_block_device)
             expert_gate_w = torch.empty(
                 self.experts_per_rank, *self.experts[0].gate_proj.weight.shape,
                 dtype=self.experts[0].gate_proj.weight.dtype,
@@ -649,7 +656,8 @@ class DeepseekV2MoE(nn.Module):
                 self.experts[i].down_proj.weight = None
             torch.cuda.empty_cache()
             self.vtensor = VTensor([expert_gate_w, expert_up_w, expert_down_w],
-                                   cache_budget=self.experts_per_rank//2) ## why by 4?
+                                   cache_budget=self.experts_per_rank//2 if self.layer_idx >= self.target_offset 
+                                    else self.experts_per_rank) ## why by 4?
             self.first_run = False
             y = hidden_states
             train_data = None
@@ -668,16 +676,16 @@ class DeepseekV2MoE(nn.Module):
                 # self.predictor_model was converted to torch.bfloat16 in __init__.
                 input_to_predictor = _hidden_state_slice.detach().to(torch.bfloat16)
 
-            target_offset = 8
-            if self.layer_idx + target_offset in vtensors and \
+            
+            if self.layer_idx + self.target_offset in vtensors and \
                 hidden_states.shape[1] < 2:
                 if self.use_oracle:
                     # This branch uses oracle for actual prefetching if self.use_oracle is True
                     predicted_experts_four_layers_ahead_for_prefetch = \
-                        self.oracle_data[f"{cur_step}_{self.layer_idx + target_offset}"]
+                        self.oracle_data[f"{cur_step}_{self.layer_idx + self.target_offset}"]
                     if isinstance(predicted_experts_four_layers_ahead_for_prefetch, torch.Tensor):
                         predicted_experts_four_layers_ahead_for_prefetch = predicted_experts_four_layers_ahead_for_prefetch.tolist()
-                    vtensors[self.layer_idx + target_offset].async_prefetch(predicted_experts_four_layers_ahead_for_prefetch) 
+                    vtensors[self.layer_idx + self.target_offset].async_prefetch(predicted_experts_four_layers_ahead_for_prefetch) 
                 else:
                     # This branch uses the predictor model
                     predicted_experts_four_layers_ahead_for_prefetch = \
@@ -689,7 +697,7 @@ class DeepseekV2MoE(nn.Module):
                         ).tolist()
                     
                     # Calculate hit rate against oracle data if available
-                    oracle_key = f"{cur_step}_{self.layer_idx + target_offset}"
+                    oracle_key = f"{cur_step}_{self.layer_idx + self.target_offset}"
                     if hasattr(self, 'oracle_data') and self.oracle_data is not None and oracle_key in self.oracle_data:
                         oracle_target_experts = self.oracle_data[oracle_key]
                         if isinstance(oracle_target_experts, torch.Tensor):
@@ -709,12 +717,12 @@ class DeepseekV2MoE(nn.Module):
                         self.hit_rates_log.append({
                             "step": cur_step,
                             "predicting_layer_idx": self.layer_idx,
-                            "predicted_for_layer_idx": self.layer_idx + target_offset,
+                            "predicted_for_layer_idx": self.layer_idx + self.target_offset,
                             "hit_rate": hit_rate,
                             "predicted_experts": predicted_experts_four_layers_ahead_for_prefetch,
                             "oracle_experts": oracle_target_experts # Oracle experts for this specific future layer
                         })
-                    vtensors[self.layer_idx + target_offset].async_prefetch(predicted_experts_four_layers_ahead_for_prefetch) 
+                    vtensors[self.layer_idx + self.target_offset].async_prefetch(predicted_experts_four_layers_ahead_for_prefetch) 
 
                 
                 # # print("Async prefetch done")

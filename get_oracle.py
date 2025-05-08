@@ -3,7 +3,7 @@ import json
 import os
 
 # path = "run_664602"
-path = "/data/mert_cemri/new/CS262_moe/run_710417"
+path = "run_739942"
 expert_idx = {}
 
 # Iterate over all files in the directory
