@@ -685,7 +685,7 @@ class DeepseekV2MoE(nn.Module):
                             input_to_predictor, # Pass the prepared input (GPU tensor or CPU numpy array)
                             self.predictor_model, # Already on GPU (bfloat16)
                             scaler=self.scaler, # Pass the scaler; function will use if not None
-                            top_k=6 # This is the k for prediction
+                            top_k=2 # This is the k for prediction
                         ).tolist()
                     
                     # Calculate hit rate against oracle data if available
@@ -703,8 +703,8 @@ class DeepseekV2MoE(nn.Module):
                         # or min(len(predicted), len(oracle)) or len(predicted) depending on definition.
                         # Using len(oracle_target_experts) if it's fixed, or len(predicted) if we check against our k predictions.
                         # Let's use len(predicted_experts_four_layers_ahead_for_prefetch) as it's our prediction's k.
-                        num_predicted = len(predicted_experts_four_layers_ahead_for_prefetch)
-                        hit_rate = common_experts / num_predicted if num_predicted > 0 else 0.0
+                        num_true_experts = len(oracle_target_experts)
+                        hit_rate = common_experts / num_true_experts if num_true_experts > 0 else 0.0
                         
                         self.hit_rates_log.append({
                             "step": cur_step,
