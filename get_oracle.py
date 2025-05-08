@@ -2,13 +2,14 @@ import torch
 import json
 import os
 
-path = "run_664602"
+# path = "run_664602"
+path = "/data/mert_cemri/new/CS262_moe/run_710417"
 expert_idx = {}
 
 # Iterate over all files in the directory
 for filename in os.listdir(path):
     # Check if the file is a .safetensors file
-    if filename.endswith(".json"):
+    if filename.endswith(".json") and "vtensor" in filename:
         # Construct full file path
         file_path = os.path.join(path, filename)
         data_i = json.load(open(file_path, "r"))

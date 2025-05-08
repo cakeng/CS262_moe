@@ -575,20 +575,23 @@ class DeepseekV2MoE(nn.Module):
             )
             
         self.first_run = True
+        self.main_block_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.predictor_model = ExpertPredictionModel(input_dim=2048, hidden_dims=[1024, 512, 256], output_dim=64)
         try:
-            self.predictor_model.load_state_dict(torch.load('best_expert_prediction_model_new.pt', map_location='cpu', weights_only=True))
+            self.predictor_model.load_state_dict(torch.load('best_expert_prediction_model_new_8.pt', map_location=self.main_block_device, weights_only=True))
         except TypeError: # Fallback for older PyTorch or if file isn't just weights
-             self.predictor_model.load_state_dict(torch.load('best_expert_prediction_model_new.pt', map_location='cpu'))
+             self.predictor_model.load_state_dict(torch.load('best_expert_prediction_model_new_8.pt', map_location=self.main_block_device))
         except FileNotFoundError:
-            logger.warning("Predictor model weights 'best_expert_prediction_model_new.pt' not found. Using random weights for predictor.")
+            logger.warning("Predictor model weights 'best_expert_prediction_model_new_8.pt' not found. Using random weights for predictor.")
         
         # Unconditionally convert the predictor model to bfloat16.
         # This will also move it to the appropriate device if the model this MoE layer belongs to is on CUDA.
         self.predictor_model.to(torch.bfloat16) 
+        self.predictor_model.to(self.main_block_device)
         try:
-            self.scaler = joblib.load('expert_predictor_scaler.gz')
-            logger.info("Successfully loaded 'expert_predictor_scaler.gz'.")
+            self.scaler = joblib.load('expert_predictor_scaler_8.gz')
+            logger.info("Successfully loaded 'expert_predictor_scaler_8.gz'.")
+            print("Successfully loaded 'expert_predictor_scaler_8.gz'.")
         except FileNotFoundError:
             logger.warning(
                 "Scaler file 'expert_predictor_scaler.gz' not found. "
@@ -600,7 +603,7 @@ class DeepseekV2MoE(nn.Module):
             logger.error(f"Error loading 'expert_predictor_scaler.gz': {e}")
             self.scaler = None
 
-        self.use_oracle = True
+        self.use_oracle = False
         if self.use_oracle: # This controls using oracle for prefetching, not for loading data for comparison
             self.oracle_data = torch.load("oracle_expert_idx.pt")
             print("Oracle expert indices loaded from 'oracle_expert_idx.pt' for prefetching.")
@@ -652,8 +655,20 @@ class DeepseekV2MoE(nn.Module):
             train_data = None
         else:
             identity = hidden_states
-            hidden_state_for_pred = identity[-1,-1,:].cpu().detach().to(torch.float32).numpy()
-            target_offset = 4
+            # Prepare the input for the expert predictor model
+            _hidden_state_slice = identity[-1, -1, :] # This is a slice of the hidden_states tensor, on GPU
+
+            if self.scaler:
+                # If a scaler is present, it requires a NumPy array on the CPU.
+                # Convert the slice to float32 for the scaler, then to NumPy.
+                hidden_state_for_pred_numpy = _hidden_state_slice.cpu().detach().to(torch.float32).numpy()
+                input_to_predictor = hidden_state_for_pred_numpy
+            else:
+                # No scaler, keep the tensor on GPU and convert to bfloat16 to match the predictor_model's dtype.
+                # self.predictor_model was converted to torch.bfloat16 in __init__.
+                input_to_predictor = _hidden_state_slice.detach().to(torch.bfloat16)
+
+            target_offset = 8
             if self.layer_idx + target_offset in vtensors and \
                 hidden_states.shape[1] < 2:
                 if self.use_oracle:
@@ -662,44 +677,46 @@ class DeepseekV2MoE(nn.Module):
                         self.oracle_data[f"{cur_step}_{self.layer_idx + target_offset}"]
                     if isinstance(predicted_experts_four_layers_ahead_for_prefetch, torch.Tensor):
                         predicted_experts_four_layers_ahead_for_prefetch = predicted_experts_four_layers_ahead_for_prefetch.tolist()
+                    vtensors[self.layer_idx + target_offset].async_prefetch(predicted_experts_four_layers_ahead_for_prefetch) 
                 else:
                     # This branch uses the predictor model
                     predicted_experts_four_layers_ahead_for_prefetch = \
                         predict_experts_from_hidden_state(
-                            hidden_state_for_pred, 
-                            self.predictor_model,
-                            scaler=self.scaler, # Pass the loaded scaler,
-                            top_k=16 # This is the k for prediction
+                            input_to_predictor, # Pass the prepared input (GPU tensor or CPU numpy array)
+                            self.predictor_model, # Already on GPU (bfloat16)
+                            scaler=self.scaler, # Pass the scaler; function will use if not None
+                            top_k=6 # This is the k for prediction
                         ).tolist()
                     
-                # Calculate hit rate against oracle data if available
-                oracle_key = f"{cur_step}_{self.layer_idx + target_offset}"
-                if hasattr(self, 'oracle_data') and self.oracle_data is not None and oracle_key in self.oracle_data:
-                    oracle_target_experts = self.oracle_data[oracle_key]
-                    if isinstance(oracle_target_experts, torch.Tensor):
-                        oracle_target_experts = oracle_target_experts.tolist()
-                    
-                    # Ensure predicted_experts_four_layers_ahead_for_prefetch is a list for set operations
-                    # It should already be a list from .tolist() above
-                    
-                    common_experts = len(set(predicted_experts_four_layers_ahead_for_prefetch).intersection(set(oracle_target_experts)))
-                    # The denominator for hit rate should be based on the number of items in oracle_target_experts 
-                    # or min(len(predicted), len(oracle)) or len(predicted) depending on definition.
-                    # Using len(oracle_target_experts) if it's fixed, or len(predicted) if we check against our k predictions.
-                    # Let's use len(predicted_experts_four_layers_ahead_for_prefetch) as it's our prediction's k.
-                    num_predicted = len(predicted_experts_four_layers_ahead_for_prefetch)
-                    hit_rate = common_experts / num_predicted if num_predicted > 0 else 0.0
-                    
-                    self.hit_rates_log.append({
-                        "step": cur_step,
-                        "predicting_layer_idx": self.layer_idx,
-                        "predicted_for_layer_idx": self.layer_idx + target_offset,
-                        "hit_rate": hit_rate,
-                        "predicted_experts": predicted_experts_four_layers_ahead_for_prefetch,
-                        "oracle_experts": oracle_target_experts # Oracle experts for this specific future layer
-                    })
+                    # Calculate hit rate against oracle data if available
+                    oracle_key = f"{cur_step}_{self.layer_idx + target_offset}"
+                    if hasattr(self, 'oracle_data') and self.oracle_data is not None and oracle_key in self.oracle_data:
+                        oracle_target_experts = self.oracle_data[oracle_key]
+                        if isinstance(oracle_target_experts, torch.Tensor):
+                            oracle_target_experts = oracle_target_experts.tolist()
+                        
+                        # Ensure predicted_experts_four_layers_ahead_for_prefetch is a list for set operations
+                        # It should already be a list from .tolist() above
+                        
+                        common_experts = len(set(predicted_experts_four_layers_ahead_for_prefetch).intersection(set(oracle_target_experts)))
+                        # The denominator for hit rate should be based on the number of items in oracle_target_experts 
+                        # or min(len(predicted), len(oracle)) or len(predicted) depending on definition.
+                        # Using len(oracle_target_experts) if it's fixed, or len(predicted) if we check against our k predictions.
+                        # Let's use len(predicted_experts_four_layers_ahead_for_prefetch) as it's our prediction's k.
+                        num_predicted = len(predicted_experts_four_layers_ahead_for_prefetch)
+                        hit_rate = common_experts / num_predicted if num_predicted > 0 else 0.0
+                        
+                        self.hit_rates_log.append({
+                            "step": cur_step,
+                            "predicting_layer_idx": self.layer_idx,
+                            "predicted_for_layer_idx": self.layer_idx + target_offset,
+                            "hit_rate": hit_rate,
+                            "predicted_experts": predicted_experts_four_layers_ahead_for_prefetch,
+                            "oracle_experts": oracle_target_experts # Oracle experts for this specific future layer
+                        })
+                    vtensors[self.layer_idx + target_offset].async_prefetch(predicted_experts_four_layers_ahead_for_prefetch) 
 
-                vtensors[self.layer_idx + target_offset].async_prefetch(predicted_experts_four_layers_ahead_for_prefetch) 
+                
                 # # print("Async prefetch done")
 
             orig_shape = hidden_states.shape
