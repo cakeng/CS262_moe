@@ -407,13 +407,13 @@ class DeepseekV2MLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def forward(self, x, vtensors=None):
+    def forward(self, x, cur_step=None, vtensors=None):
         name = self.name if self.name else "MLP"
         if _do_print_:
             print(y_str(f"\tRunning ") + f"{name} " 
                 + y_str(f"for layer ") + f"{self.layer_idx}")
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-        return down_proj
+        return down_proj, None
 
 
 class MoEGate(nn.Module):
@@ -520,7 +520,7 @@ class MoEGate(nn.Module):
                 aux_loss = (Pi * fi).sum() * self.alpha
         else:
             aux_loss = None
-        return topk_idx, topk_weight, aux_loss
+        return topk_idx, topk_weight, aux_loss, logits
 
 
 class AddAuxiliaryLoss(torch.autograd.Function):
@@ -600,8 +600,12 @@ class DeepseekV2MoE(nn.Module):
             logger.error(f"Error loading 'expert_predictor_scaler.gz': {e}")
             self.scaler = None
 
+        self.use_oracle = True
+        if self.use_oracle:
+            self.oracle_data = torch.load("oracle_expert_idx.pt")
+            print("Oracle expert indices loaded from 'oracle_expert_idx.pt'")
 
-    def forward(self, hidden_states, vtensors=None):
+    def forward(self, hidden_states, cur_step=None, vtensors=None):
         if self.first_run:
             expert_gate_w = torch.empty(
                 self.experts_per_rank, *self.experts[0].gate_proj.weight.shape,
@@ -631,32 +635,44 @@ class DeepseekV2MoE(nn.Module):
             torch.cuda.empty_cache()
             self.vtensor = VTensor([expert_gate_w, expert_up_w, expert_down_w],
                                    cache_budget=self.experts_per_rank//4) ## why by 4?
-       
-    def forward(self, hidden_states, vtensors=None):
-        if self.first_run:
             self.first_run = False
             y = hidden_states
+            train_data = None
         else:
             identity = hidden_states
             hidden_state_for_pred = identity[-1,-1,:].cpu().detach().to(torch.float32).numpy()
-            target_offset = 4
-            if self.layer_idx + target_offset in vtensors:
-                predicted_experts_four_layers_ahead = predict_experts_from_hidden_state(
-                hidden_state_for_pred, 
-                self.predictor_model,
-                scaler=self.scaler, # Pass the loaded scaler,
-                top_k=2
-                )
-                vtensors[self.layer_idx + target_offset].async_prefetch(predicted_experts_four_layers_ahead.tolist()) 
+            target_offset = 3
+            if self.layer_idx + target_offset in vtensors and \
+                hidden_states.shape[1] < 2:
+                if self.use_oracle:
+                    predicted_experts_four_layers_ahead = \
+                        self.oracle_data[f"{cur_step}_{self.layer_idx + target_offset}"]
+                else:
+                    predicted_experts_four_layers_ahead = \
+                        predict_experts_from_hidden_state(
+                            hidden_state_for_pred, 
+                            self.predictor_model,
+                            scaler=self.scaler, # Pass the loaded scaler,
+                            top_k=2
+                        ).tolist()
+                vtensors[self.layer_idx + target_offset].async_prefetch(predicted_experts_four_layers_ahead) 
                 # print("Async prefetch done")
 
             orig_shape = hidden_states.shape
-            topk_idx, topk_weight, aux_loss = self.gate(hidden_states)
+            topk_idx, topk_weight, aux_loss, logits = self.gate(hidden_states)
             hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-            y = self.moe_infer(hidden_states, topk_idx, topk_weight).view(*orig_shape)
+            y, expert_idx = self.moe_infer(hidden_states, topk_idx, topk_weight)
+            y = y.view(*orig_shape)
+            train_data = {f"{cur_step}_{self.layer_idx}": {
+                "hidden_states": identity,
+                "logits": logits,
+                "topk_idx": topk_idx,
+                "topk_weight": topk_weight,
+            }}
             if self.config.n_shared_experts is not None:
-                y = y + self.shared_experts(identity)
-        return y
+                s_y, _ = self.shared_experts(identity)
+                y = y + s_y
+        return y, train_data
 
     @torch.no_grad()
     def moe_infer(self, x, topk_ids, topk_weight):
@@ -667,23 +683,22 @@ class DeepseekV2MoE(nn.Module):
         sorted_tokens = x[idxs // topk_ids.shape[1]]
         sorted_tokens_shape = sorted_tokens.shape
         tokens_per_expert = tokens_per_expert.cpu().numpy()
-        
-        for i, num_tokens in enumerate(tokens_per_expert):
-            if num_tokens != 0:
-                gate_up_down_w = self.vtensor.get(i)
-                self.experts[i].gate_proj.weight = gate_up_down_w[0]
-                self.experts[i].up_proj.weight = gate_up_down_w[1]
-                self.experts[i].down_proj.weight = gate_up_down_w[2]
 
+        expert_idx = []
         outputs = []
         start_idx = 0
         for i, num_tokens in enumerate(tokens_per_expert):
             end_idx = start_idx + num_tokens
             if num_tokens == 0:
                 continue
+            expert_idx.append(i)
+            gate_up_down_w = self.vtensor.get(i)
+            self.experts[i].gate_proj.weight = gate_up_down_w[0]
+            self.experts[i].up_proj.weight = gate_up_down_w[1]
+            self.experts[i].down_proj.weight = gate_up_down_w[2]
             expert = self.experts[i]
             tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
-            expert_out = expert(tokens_for_this_expert)
+            expert_out, _ = expert(tokens_for_this_expert)
             outputs.append(expert_out)
             start_idx = end_idx
 
@@ -699,7 +714,7 @@ class DeepseekV2MoE(nn.Module):
             .type(new_x.dtype)
         )
 
-        return final_out
+        return final_out, expert_idx
 
 
 # Copied from transformers.models.llama.modeling_llama.repeat_kv
@@ -1266,6 +1281,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
+        cur_step: Optional[int] = None,
         vtensors: Optional[VTensor] = None,
         **kwargs,
     ) -> Tuple[
@@ -1310,7 +1326,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states, vtensors=vtensors)
+        hidden_states, train_data = self.mlp(hidden_states, cur_step=cur_step, vtensors=vtensors)
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
@@ -1321,7 +1337,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         if use_cache:
             outputs += (present_key_value,)
 
-        return outputs
+        return outputs, train_data
+
 
 
 DeepseekV2_START_DOCSTRING = r"""
@@ -1469,6 +1486,7 @@ class DeepseekV2Model(DeepseekV2PreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
         self.vtensors = {}
+        self.train_datas = {}
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -1589,17 +1607,19 @@ class DeepseekV2Model(DeepseekV2PreTrainedModel):
                     use_cache,
                 )
             else:
-                print(f"At layer {i}")
-                print(f"Length of vtensors: {len(vtensors)}")
-                layer_outputs = decoder_layer(
+                layer_outputs, train_data = decoder_layer(
                     hidden_states,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
                     past_key_value=past_key_values,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
+                    cur_step=step_idx,
                     vtensors=self.vtensors,
                 )
+            
+            if train_data is not None:
+                self.train_datas.update(train_data)
 
             hidden_states = layer_outputs[0]
             if isinstance(decoder_layer.mlp, DeepseekV2MoE):
@@ -1612,6 +1632,12 @@ class DeepseekV2Model(DeepseekV2PreTrainedModel):
                 all_self_attns += (layer_outputs[1],)
 
         hidden_states = self.norm(hidden_states)
+        
+        # torch.save(
+        #     self.train_datas,
+        #     os.path.join(self.out_path, f"train_data.pt"),
+        # )
+        # print(train_data)
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
