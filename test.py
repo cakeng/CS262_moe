@@ -68,6 +68,6 @@ print(tokenizer.decode(outputs[0], skip_special_tokens=True))
 time_start = time.time()
 num_iter = 2
 for i in range(num_iter):
-    outputs = model.generate(**inputs, max_new_tokens=100, do_sample=False,)
-    # print(tokenizer.decode(outputs[0], skip_special_tokens=True))
+    outputs = model.generate(**inputs, max_new_tokens=100, do_sample=True, temperature=0.7)
+    print(tokenizer.decode(outputs[0], skip_special_tokens=True))
 print(f"Time taken for {num_iter} iterations: ", time.time() - time_start)
