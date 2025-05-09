@@ -599,7 +599,7 @@ class DeepseekV2MoE(nn.Module):
             logger.error(f"Error loading 'expert_predictor_scaler.gz': {e}")
             self.scaler = None
 
-        self.use_oracle = False
+        self.use_oracle = True
         if self.use_oracle: # This controls using oracle for prefetching, not for loading data for comparison
             self.oracle_data = torch.load("oracle_expert_idx.pt")
             print("Oracle expert indices loaded from 'oracle_expert_idx.pt' for prefetching.")
@@ -1658,48 +1658,95 @@ class DeepseekV2Model(DeepseekV2PreTrainedModel):
         
         next_decoder_cache = None
 
-        for i, decoder_layer in enumerate(self.layers):
+        if step_idx == 10:
+            torch.cuda.profiler.cudart().cudaProfilerStart()
+            torch.cuda.nvtx.range_push("DeepSeek Step 10 Execution")
+            for i, decoder_layer in enumerate(self.layers):
 
-            # print(f"At layer {i}")
-            # print(f"Length of vtensors: {len(self.vtensors)}")
+                # print(f"At layer {i}")
+                # print(f"Length of vtensors: {len(self.vtensors)}")
 
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
+                if output_hidden_states:
+                    all_hidden_states += (hidden_states,)
 
-            if self.gradient_checkpointing and self.training:
-                layer_outputs = self._gradient_checkpointing_func(
-                    decoder_layer.__call__,
-                    hidden_states,
-                    attention_mask,
-                    position_ids,
-                    past_key_values,
-                    output_attentions,
-                    use_cache,
-                )
-            else:
-                layer_outputs, train_data = decoder_layer(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    cur_step=step_idx,
-                    vtensors=self.vtensors,
-                )
-            
-            if train_data is not None:
-                self.train_datas.update(train_data)
+                if self.gradient_checkpointing and self.training:
+                    layer_outputs = self._gradient_checkpointing_func(
+                        decoder_layer.__call__,
+                        hidden_states,
+                        attention_mask,
+                        position_ids,
+                        past_key_values,
+                        output_attentions,
+                        use_cache,
+                    )
+                else:
+                    layer_outputs, train_data = decoder_layer(
+                        hidden_states,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_values,
+                        output_attentions=output_attentions,
+                        use_cache=use_cache,
+                        cur_step=step_idx,
+                        vtensors=self.vtensors,
+                    )
+                
+                if train_data is not None:
+                    self.train_datas.update(train_data)
 
-            hidden_states = layer_outputs[0]
-            if isinstance(decoder_layer.mlp, DeepseekV2MoE):
-                self.vtensors[i] = decoder_layer.mlp.vtensor
+                hidden_states = layer_outputs[0]
+                if isinstance(decoder_layer.mlp, DeepseekV2MoE):
+                    self.vtensors[i] = decoder_layer.mlp.vtensor
 
-            if use_cache:
-                next_decoder_cache = layer_outputs[2 if output_attentions else 1]
+                if use_cache:
+                    next_decoder_cache = layer_outputs[2 if output_attentions else 1]
 
-            if output_attentions:
-                all_self_attns += (layer_outputs[1],)
+                if output_attentions:
+                    all_self_attns += (layer_outputs[1],)
+            torch.cuda.nvtx.range_pop()
+        else:
+            for i, decoder_layer in enumerate(self.layers):
+
+                # print(f"At layer {i}")
+                # print(f"Length of vtensors: {len(self.vtensors)}")
+
+                if output_hidden_states:
+                    all_hidden_states += (hidden_states,)
+
+                if self.gradient_checkpointing and self.training:
+                    layer_outputs = self._gradient_checkpointing_func(
+                        decoder_layer.__call__,
+                        hidden_states,
+                        attention_mask,
+                        position_ids,
+                        past_key_values,
+                        output_attentions,
+                        use_cache,
+                    )
+                else:
+                    layer_outputs, train_data = decoder_layer(
+                        hidden_states,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_values,
+                        output_attentions=output_attentions,
+                        use_cache=use_cache,
+                        cur_step=step_idx,
+                        vtensors=self.vtensors,
+                    )
+                
+                if train_data is not None:
+                    self.train_datas.update(train_data)
+
+                hidden_states = layer_outputs[0]
+                if isinstance(decoder_layer.mlp, DeepseekV2MoE):
+                    self.vtensors[i] = decoder_layer.mlp.vtensor
+
+                if use_cache:
+                    next_decoder_cache = layer_outputs[2 if output_attentions else 1]
+
+                if output_attentions:
+                    all_self_attns += (layer_outputs[1],)
 
         hidden_states = self.norm(hidden_states)
         
