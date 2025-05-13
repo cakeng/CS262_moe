@@ -250,9 +250,9 @@ class VTensor:
             with torch.cuda.stream(self.stream):
                 for original_id in ids_to_fetch:
                     if not self.free_gpu_indices:
-                        print(
-                            f"Warning: Ran out of GPU indices during prefetch for ID {original_id}, likely due to eviction issues. Skipping."
-                        )
+                        # print(
+                        #     f"Warning: Ran out of GPU indices during prefetch for ID {original_id}, likely due to eviction issues. Skipping."
+                        # )
                         continue  # Should have enough space after evictions, but safety check
 
                     target_cache_index = self.free_gpu_indices.pop(0)

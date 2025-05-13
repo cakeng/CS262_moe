@@ -557,6 +557,7 @@ class DeepseekV2MoE(nn.Module):
         self.ep_size = 1
         self.experts_per_rank = config.n_routed_experts
         self.ep_rank = 0
+        self.config = config
         self.experts = nn.ModuleList(
             [
                 DeepseekV2MLP(
@@ -573,8 +574,7 @@ class DeepseekV2MoE(nn.Module):
                 config=config, intermediate_size=intermediate_size,
                 layer_idx=layer_idx, name="shared_experts"
             )
-        
-        self.target_offset = 8
+        self.target_offset = self.config.num_lookahead_size
         self.first_run = True
         self.main_block_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.predictor_model = ExpertPredictionModel(input_dim=2048, hidden_dims=[1024, 512, 256], output_dim=64)
@@ -591,7 +591,7 @@ class DeepseekV2MoE(nn.Module):
         except FileNotFoundError:
             logger.warning(
                 "Scaler file 'expert_predictor_scaler.gz' not found. "
-                "Predictions from ExpertPredictionModel will not be scaled. "
+                "Predictions from ExpertPredictionMosdel will not be scaled. "
                 "This may lead to suboptimal performance if the model was trained with scaled inputs."
             )
             self.scaler = None
@@ -599,7 +599,7 @@ class DeepseekV2MoE(nn.Module):
             logger.error(f"Error loading 'expert_predictor_scaler.gz': {e}")
             self.scaler = None
 
-        self.use_oracle = True
+        self.use_oracle = self.config.use_oracle
         if self.use_oracle: # This controls using oracle for prefetching, not for loading data for comparison
             self.oracle_data = torch.load("oracle_expert_idx.pt")
             print("Oracle expert indices loaded from 'oracle_expert_idx.pt' for prefetching.")
@@ -656,7 +656,7 @@ class DeepseekV2MoE(nn.Module):
                 self.experts[i].down_proj.weight = None
             torch.cuda.empty_cache()
             self.vtensor = VTensor([expert_gate_w, expert_up_w, expert_down_w],
-                                   cache_budget=self.experts_per_rank//2 if self.layer_idx >= self.target_offset 
+                                   cache_budget=self.config.num_cache_size if self.layer_idx >= self.target_offset 
                                     else self.experts_per_rank) ## why by 4?
             self.first_run = False
             y = hidden_states
@@ -678,7 +678,7 @@ class DeepseekV2MoE(nn.Module):
 
             
             if self.layer_idx + self.target_offset in vtensors and \
-                hidden_states.shape[1] < 2:
+                hidden_states.shape[1] < 2 and self.config.use_prefetch:
                 if self.use_oracle:
                     # This branch uses oracle for actual prefetching if self.use_oracle is True
                     predicted_experts_four_layers_ahead_for_prefetch = \
@@ -688,12 +688,13 @@ class DeepseekV2MoE(nn.Module):
                     vtensors[self.layer_idx + self.target_offset].async_prefetch(predicted_experts_four_layers_ahead_for_prefetch) 
                 else:
                     # This branch uses the predictor model
+                    prefetch_size = min(self.config.prefetch_size, self.config.num_cache_size) 
                     predicted_experts_four_layers_ahead_for_prefetch = \
                         predict_experts_from_hidden_state(
                             input_to_predictor, # Pass the prepared input (GPU tensor or CPU numpy array)
                             self.predictor_model, # Already on GPU (bfloat16)
                             scaler=self.scaler, # Pass the scaler; function will use if not None
-                            top_k=2 # This is the k for prediction
+                            top_k=prefetch_size # This is the k for prediction
                         ).tolist()
                     
                     # Calculate hit rate against oracle data if available
@@ -1790,7 +1791,7 @@ class DeepseekV2ForCausalLM(DeepseekV2PreTrainedModel):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.steps = 0
         rand_num = str(int(time.time()))[-6:]
-        self.out_path = f"run_{rand_num}"
+        self.out_path = f"test_output"
         os.makedirs(self.out_path, exist_ok=True)
         # Initialize weights and apply final processing
         print(g_str("Initializing CS262 DeepSeek V2 Model: ") + 
@@ -1871,7 +1872,7 @@ class DeepseekV2ForCausalLM(DeepseekV2PreTrainedModel):
         return_dict = (
             return_dict if return_dict is not None else self.config.use_return_dict
         )
-        print(y_str("Running step ") + str(self.steps))
+        # print(y_str("Running step ") + str(self.steps))
         self.steps += 1
         start_time = time.time()
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)

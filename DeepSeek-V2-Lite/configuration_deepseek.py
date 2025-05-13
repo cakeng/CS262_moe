@@ -154,8 +154,19 @@ class DeepseekV2Config(PretrainedConfig):
         rope_scaling=None,
         attention_bias=False,
         attention_dropout=0.0,
+        num_cache_size=0,
+        num_lookahead_size=0,
+        prefetch_size=0,
+        use_oracle=False,
+        use_prefetch=False,
         **kwargs,
     ):
+        self.num_cache_size = num_cache_size
+        self.num_lookahead_size = num_lookahead_size
+        self.prefetch_size = prefetch_size
+        self.use_oracle = use_oracle
+        self.use_prefetch = use_prefetch
+        
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
