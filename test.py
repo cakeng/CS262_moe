@@ -52,13 +52,23 @@ prefetch_size_list = [2, 4, 6, 8, 10, 12]
 use_oracle_list = [True, False]
 use_prefetch_list = [True, False]
 
-out_csv_path = "test_results.csv"
-if os.path.exists(out_csv_path):
-    os.remove(out_csv_path)
+settings = [
+    [[False], [True], [1, 2, 4, 8, 16, 32, 64], [8], [6]],
+    [[True], [True], [1, 2, 4, 8, 16, 32, 64], [8], [6]],
+    [[True], [False], [1, 2, 4, 8, 16, 32, 64], [8], [6]],
+    [[True], [True], [32], [2, 4, 6, 8, 10, 12], [6]],
+    [[True], [False], [32], [2, 4, 6, 8, 10, 12], [6]],
+    [[True], [True], [32], [8], [2, 4, 6, 8, 10, 12]],
+    [[True], [False], [32], [8], [2, 4, 6, 8, 10, 12]],
+]
 
-with open(out_csv_path, "w") as f:
-    f.write("use_prefetch, use_oracle, num_cache_size, num_lookahead_size, "
-            + "prefetch_size, time_taken, prefetch_hit_ratio, cache_hit_ratio\n")
+out_csv_path = "test_results.csv"
+# if os.path.exists(out_csv_path):
+#     os.remove(out_csv_path)
+
+# with open(out_csv_path, "w") as f:
+#     f.write("use_prefetch, use_oracle, num_cache_size, num_lookahead_size, "
+#             + "prefetch_size, time_taken, prefetch_hit_ratio, cache_hit_ratio\n")
     
 for use_prefetch, use_oracle, num_cache_size, num_lookahead_size, \
     prefetch_size in product(
